@@ -45,7 +45,14 @@ const CONFIG = {
   },
   lantern: { radius: 0.55, height: 0.9 },
   rocks: { seed: 20261119, count: 9, islandRadius: 3.0 },
-  sea: { size: 240, color: 0x0b1e3a },
+  sea: {
+    size: 240, color: 0x0b1e3a, segments: 180,
+    waves: [  // 三层正弦波叠加（幅度 / 波长 / 方向 / 相速度）
+      { amp: 0.28, len: 14,  dir: [1, 0.3],  speed: 1.2 },
+      { amp: 0.16, len: 7.5, dir: [-0.7, 1], speed: 1.8 },
+      { amp: 0.09, len: 4,   dir: [0.3, -1], speed: 2.6 },
+    ],
+  },
   sky: {
     background: 0x0a1224,
     zenith: 0x050915,        // 天顶色
@@ -337,11 +344,53 @@ const clouds = buildClouds();
 scene.add(clouds);
 
 /* ============================================================
- * 海面（T3 将替换为 shader 涌浪）
+ * 海面：标准材质 + onBeforeCompile 注入三层正弦波涌浪
+ * （GPU 顶点位移 + 解析法线；光照、雾、阴影管线全部保留）
  * ============================================================ */
+const seaUniforms = { uTime: { value: 0 } };
+
+// 由 CONFIG 生成波参数常量与波场函数（波高 + 解析梯度）
+const seaWaveGLSL = CONFIG.sea.waves.map((w, i) => {
+  const k = (Math.PI * 2) / w.len;
+  const [dx, dy] = w.dir;
+  const n = Math.hypot(dx, dy);
+  return [
+    `const vec2 WDIR${i} = vec2(${(dx / n).toFixed(5)}, ${(dy / n).toFixed(5)});`,
+    `const float WAMP${i} = ${w.amp.toFixed(4)};`,
+    `const float WK${i} = ${k.toFixed(5)};`,
+    `const float WSPD${i} = ${w.speed.toFixed(3)};`,
+  ].join('\n');
+}).join('\n') + `
+float waveField(vec2 p, out vec2 grad) {
+  float h = 0.0;
+  grad = vec2(0.0);` +
+  CONFIG.sea.waves.map((_, i) => `
+  {
+    float ph = dot(WDIR${i}, p) * WK${i} + uTime * WSPD${i};
+    h += WAMP${i} * sin(ph);
+    grad += WAMP${i} * WK${i} * WDIR${i} * cos(ph);
+  }`).join('') + `
+  return h;
+}`;
+
+const seaMat = new THREE.MeshStandardMaterial({
+  color: CONFIG.sea.color, roughness: 0.35, metalness: 0.1 });
+seaMat.onBeforeCompile = (shader) => {
+  shader.uniforms.uTime = seaUniforms.uTime;
+  shader.vertexShader = shader.vertexShader
+    .replace('#include <common>', `#include <common>
+uniform float uTime;
+${seaWaveGLSL}`)
+    .replace('#include <beginnormal_vertex>', `#include <beginnormal_vertex>
+{ vec2 g; waveField(position.xy, g); objectNormal = normalize(vec3(-g.x, -g.y, 1.0)); }`)
+    .replace('#include <begin_vertex>', `#include <begin_vertex>
+{ vec2 g2; transformed.z += waveField(position.xy, g2); }`);
+};
+
 const sea = new THREE.Mesh(
-  new THREE.PlaneGeometry(CONFIG.sea.size, CONFIG.sea.size),
-  new THREE.MeshStandardMaterial({ color: CONFIG.sea.color, roughness: 0.35 }));
+  new THREE.PlaneGeometry(CONFIG.sea.size, CONFIG.sea.size,
+    CONFIG.sea.segments, CONFIG.sea.segments),
+  seaMat);
 sea.rotation.x = -Math.PI / 2;
 sea.receiveShadow = true;
 scene.add(sea);
@@ -353,6 +402,9 @@ let lastT = 0;
 renderer.setAnimationLoop((t) => {
   const dt = Math.min((t - lastT) / 1000, 0.05);
   lastT = t;
+
+  // 海面涌浪
+  seaUniforms.uTime.value = t / 1000;
 
   // 云缓慢漂移，超出范围回绕
   for (const cloud of clouds.children) {
