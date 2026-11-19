@@ -91,6 +91,10 @@ const CONFIG = {
       rainy:  { fog: 0.022,  moonI: 0.22, moonO: 0.15, wave: 1.3,  rain: 1, extraCloud: 0.9 },
     },
   },
+  gull: {
+    flyTime: 2,   // 飞离/飞回的渐变时长（秒）
+    flap: 7,      // 扇翅频率（rad/s）
+  },
 };
 
 /* ============================================================
@@ -591,6 +595,72 @@ function updateRain(dt) {
 }
 
 /* ============================================================
+ * 海鸥群：绕塔盘旋 + 扇翅 + 天气联动（雨天结伴飞离）
+ * ============================================================ */
+const gulls = [];
+{
+  const mat = new THREE.MeshStandardMaterial({
+    color: 0xdfe3ea, flatShading: true, roughness: 0.8, transparent: true });
+  const bodyGeo = new THREE.DodecahedronGeometry(0.22, 0);
+  const wingGeo = new THREE.BoxGeometry(0.55, 0.04, 0.24);
+  wingGeo.translate(0.3, 0, 0); // 翼根为旋转轴
+
+  // 各自不同的轨道：半径 / 宽度 / 高度 / 相位 / 角速度
+  const orbits = [
+    { a: 10, b: 5,   h: 9,  phase: 0,   speed: 0.5 },
+    { a: 13, b: 6.5, h: 11, phase: 2.1, speed: 0.42 },
+    { a: 16, b: 7.5, h: 13, phase: 4.2, speed: 0.35 },
+  ];
+  for (const o of orbits) {
+    const g = new THREE.Group();
+    const body = new THREE.Mesh(bodyGeo, mat);
+    body.scale.set(0.9, 0.75, 1.7); // z 为前向（+z 对准飞行方向）
+    body.castShadow = true;
+    g.add(body);
+    const wl = new THREE.Mesh(wingGeo, mat);
+    const wr = new THREE.Mesh(wingGeo, mat);
+    wr.rotation.y = Math.PI;
+    wl.position.set(-0.1, 0.06, 0);
+    wr.position.set(0.1, 0.06, 0);
+    g.add(wl, wr);
+    g.userData = { ...o, wl, wr };
+    scene.add(g);
+    gulls.push(g);
+  }
+}
+const gullMat = gulls[0].children[0].material;
+let gullFly = 0;        // 0 = 在场盘旋 → 1 = 已飞离
+let gullFlyTarget = 0;
+
+function updateGulls(t, dt) {
+  // 天气联动：雨大则飞离，转好则飞回
+  gullFlyTarget = weatherState.rain > 0.5 ? 1 : 0;
+  if (gullFly !== gullFlyTarget) {
+    const dir = Math.sign(gullFlyTarget - gullFly);
+    gullFly = THREE.MathUtils.clamp(gullFly + dir * dt / CONFIG.gull.flyTime, 0, 1);
+    gullMat.opacity = 1 - gullFly;
+  }
+  const present = gullFly < 0.999;
+  for (const g of gulls) {
+    g.visible = present;
+    if (!present) continue;
+    const o = g.userData;
+    const ang = t / 1000 * o.speed + o.phase;
+    const px = Math.cos(ang) * o.a, pz = Math.sin(ang) * o.b;
+    const py = o.h + Math.sin(ang * 2.3 + o.phase) * 0.6; // 轻微起伏
+    // 飞离偏移：结伴向远方飞升
+    const ox = gullFly * 55, oy = gullFly * 18, oz = gullFly * 30;
+    g.position.set(px + ox, py + oy, pz + oz);
+    g.lookAt( // 朝向轨道切线（略前方的未来位置）
+      Math.cos(ang + 0.12) * o.a + ox, py + oy + 0.4,
+      Math.sin(ang + 0.12) * o.b + oz);
+    const flap = Math.sin(t / 1000 * CONFIG.gull.flap + o.phase * 3) * 0.55;
+    o.wl.rotation.z = flap;
+    o.wr.rotation.z = -flap;
+  }
+}
+
+/* ============================================================
  * 相机控制：手写轨道控制器（球坐标 + 阻尼 + 触屏）
  * Pointer Events 统一鼠标与触屏：单指旋转、双指捏合缩放、滚轮缩放
  * ============================================================ */
@@ -720,6 +790,9 @@ renderer.setAnimationLoop((t) => {
     if (cloud.position.x > 160) cloud.position.x = -160;
   }
   moonGroup.lookAt(camera.position);
+
+  // 海鸥：盘旋 + 扇翅 + 天气联动
+  updateGulls(t, dt);
 
   renderer.render(scene, camera);
 });
