@@ -36,6 +36,11 @@ const CONFIG = {
     'https://cdn.jsdelivr.net/npm/three@0.187.0/build/three.module.js',
   ],
   camera: { fov: 50, position: [11, 6.5, 15], lookAt: [0, 4, 0] },
+  orbit: {
+    minR: 8, maxR: 60,       // 缩放限位
+    minPhi: 0.15, maxPhi: 1.52, // 俯仰限位（不钻到海面以下）
+    rotSpeed: 0.005, zoomSpeed: 0.0012, damping: 4.5,
+  },
   tower: {
     baseY: 1.0,          // 塔身起始高度（立于礁石台面）
     height: 6,           // 塔身总高
@@ -483,6 +488,79 @@ beamSpot.target = spotTarget;
 scene.add(beamSpot);
 
 /* ============================================================
+ * 相机控制：手写轨道控制器（球坐标 + 阻尼 + 触屏）
+ * Pointer Events 统一鼠标与触屏：单指旋转、双指捏合缩放、滚轮缩放
+ * ============================================================ */
+const orbit = { ...CONFIG.orbit,
+  target: new THREE.Vector3(...CONFIG.camera.lookAt) };
+{
+  const off = camera.position.clone().sub(orbit.target);
+  orbit.r = off.length();
+  orbit.phi = Math.acos(off.y / orbit.r);
+  orbit.theta = Math.atan2(off.x, off.z);
+}
+
+let dragging = false, velT = 0, velP = 0, lastMoveT = 0;
+const pointers = new Map();
+let pinchDist = 0;
+
+const canvasEl = renderer.domElement;
+canvasEl.style.touchAction = 'none'; // 交给我们自己处理手势
+
+const clampPhi = () => {
+  orbit.phi = THREE.MathUtils.clamp(orbit.phi, orbit.minPhi, orbit.maxPhi);
+};
+const zoomBy = (f) => {
+  orbit.r = THREE.MathUtils.clamp(orbit.r * f, orbit.minR, orbit.maxR);
+};
+
+canvasEl.addEventListener('pointerdown', (e) => {
+  canvasEl.setPointerCapture(e.pointerId);
+  pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  if (pointers.size === 1) { dragging = true; velT = velP = 0; }
+  if (pointers.size === 2) { // 进入捏合
+    dragging = false;
+    const [a, b] = [...pointers.values()];
+    pinchDist = Math.hypot(a.x - b.x, a.y - b.y);
+  }
+});
+canvasEl.addEventListener('pointermove', (e) => {
+  if (!pointers.has(e.pointerId)) return;
+  const prev = pointers.get(e.pointerId);
+  const dx = e.clientX - prev.x, dy = e.clientY - prev.y;
+  pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
+  if (pointers.size === 1 && dragging) { // 单指旋转（含鼠标拖拽）
+    orbit.theta -= dx * orbit.rotSpeed;
+    orbit.phi -= dy * orbit.rotSpeed;
+    clampPhi();
+    // 记录角速度用于松手惯性（依据事件间隔换算为 rad/s）
+    const now = performance.now();
+    const edt = Math.max(now - lastMoveT, 1);
+    lastMoveT = now;
+    velT = (-dx * orbit.rotSpeed / edt) * 1000;
+    velP = (-dy * orbit.rotSpeed / edt) * 1000;
+  } else if (pointers.size === 2) { // 双指捏合缩放
+    const [a, b] = [...pointers.values()];
+    const d = Math.hypot(a.x - b.x, a.y - b.y);
+    if (pinchDist > 0 && d > 0) zoomBy(pinchDist / d);
+    pinchDist = d;
+  }
+});
+const endPointer = (e) => {
+  pointers.delete(e.pointerId);
+  if (pointers.size === 0) dragging = false;
+  if (pointers.size < 2) pinchDist = 0;
+};
+canvasEl.addEventListener('pointerup', endPointer);
+canvasEl.addEventListener('pointercancel', endPointer);
+
+canvasEl.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  zoomBy(Math.exp(e.deltaY * orbit.zoomSpeed));
+}, { passive: false });
+
+/* ============================================================
  * 动画（统一 tick）
  * ============================================================ */
 let lastT = 0;
@@ -495,6 +573,23 @@ renderer.setAnimationLoop((t) => {
 
   // 光束旋转扫射
   beamGroup.rotation.y += CONFIG.beam.speed * dt;
+
+  // 相机：松手后惯性 + 阻尼缓停，再由球坐标驱动
+  if (!dragging) {
+    orbit.theta += velT * dt;
+    orbit.phi += velP * dt;
+    clampPhi();
+    const damp = Math.exp(-orbit.damping * dt);
+    velT *= damp; velP *= damp;
+  }
+  {
+    const sp = Math.sin(orbit.phi), cp = Math.cos(orbit.phi);
+    camera.position.set(
+      orbit.target.x + orbit.r * sp * Math.sin(orbit.theta),
+      orbit.target.y + orbit.r * cp,
+      orbit.target.z + orbit.r * sp * Math.cos(orbit.theta));
+    camera.lookAt(orbit.target);
+  }
 
   // 云缓慢漂移，超出范围回绕
   for (const cloud of clouds.children) {
