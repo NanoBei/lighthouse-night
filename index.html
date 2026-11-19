@@ -11,9 +11,13 @@
     place-items: center; background: #0a1224; color: #8ab4ff;
     font: 15px/1.8 system-ui, sans-serif; text-align: center; }
   #fallback.show { display: grid; }
+  #hint { position: fixed; left: 14px; bottom: 12px; z-index: 10;
+    color: rgba(200, 214, 240, 0.55); font: 13px/1.6 system-ui, sans-serif;
+    pointer-events: none; user-select: none; }
 </style>
 </head>
 <body>
+<div id="hint"></div>
 <div id="fallback">
   <div>
     <p>⚠️ Three.js 加载失败</p>
@@ -42,10 +46,21 @@ const CONFIG = {
   lantern: { radius: 0.55, height: 0.9 },
   rocks: { seed: 20261119, count: 9, islandRadius: 3.0 },
   sea: { size: 240, color: 0x0b1e3a },
-  sky: { color: 0x0a1224 },
+  sky: {
+    background: 0x0a1224,
+    zenith: 0x050915,        // 天顶色
+    horizon: 0x1b2a4d,       // 地平线色
+    radius: 220,
+    stars: { count: 320, bright: 60 },
+    moon: { size: 7, tint: 0xf5f3e7 },
+    clouds: { count: 8, seed: 7, color: 0x808aa0, speed: 0.6 },
+    fog: { color: 0x0a1224, density: 0.008 },
+    hint: '🖱 拖拽旋转视角 · 滚轮缩放',
+  },
   lights: {
     hemi: { sky: 0x2a3a5e, ground: 0x0a0e1a, intensity: 0.55 },
-    moon: { color: 0xbdd4ff, intensity: 2.2, position: [18, 24, -10] },
+    moon: { color: 0xbdd4ff, intensity: 1.8, position: [-30, 12, -28] }, // 相机左前方：海上明月
+    fill: { color: 0x8fa8d8, intensity: 0.5, position: [10, 8, 22] }, // 相机侧补光，防止背光面全黑
     lamp: { color: 0xffd9a0, intensity: 60, distance: 45 },
   },
 };
@@ -61,6 +76,7 @@ if (!THREE) {
   document.getElementById('fallback').classList.add('show');
   throw new Error('all CDNs failed');
 }
+document.getElementById('hint').textContent = CONFIG.sky.hint;
 
 /* ============================================================
  * 场景与灯光
@@ -73,7 +89,8 @@ renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 document.body.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(CONFIG.sky.color);
+scene.background = new THREE.Color(CONFIG.sky.background);
+scene.fog = new THREE.FogExp2(CONFIG.sky.fog.color, CONFIG.sky.fog.density);
 
 const camera = new THREE.PerspectiveCamera(
   CONFIG.camera.fov, innerWidth / innerHeight, 0.1, 500);
@@ -93,6 +110,11 @@ moonLight.shadow.camera.right = 20;
 moonLight.shadow.camera.top = 20;
 moonLight.shadow.camera.bottom = -20;
 scene.add(moonLight);
+
+const fillLight = new THREE.DirectionalLight(
+  CONFIG.lights.fill.color, CONFIG.lights.fill.intensity);
+fillLight.position.set(...CONFIG.lights.fill.position);
+scene.add(fillLight);
 
 const lampLight = new THREE.PointLight(
   CONFIG.lights.lamp.color, CONFIG.lights.lamp.intensity, CONFIG.lights.lamp.distance);
@@ -225,6 +247,96 @@ const rocks = buildRocks();
 scene.add(tower, rocks);
 
 /* ============================================================
+ * 天空氛围：渐变天穹、星点、月亮、云
+ * ============================================================ */
+// 天穹：地平线亮、天顶深的大球内壁（shader 渐变，不受雾影响）
+const skyDome = new THREE.Mesh(
+  new THREE.SphereGeometry(CONFIG.sky.radius, 24, 14),
+  new THREE.ShaderMaterial({
+    side: THREE.BackSide,
+    depthWrite: false,
+    fog: false,
+    uniforms: {
+      uZenith: { value: new THREE.Color(CONFIG.sky.zenith) },
+      uHorizon: { value: new THREE.Color(CONFIG.sky.horizon) },
+    },
+    vertexShader: /* glsl */`
+      varying vec3 vDir;
+      void main() {
+        vDir = normalize(position);
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }`,
+    fragmentShader: /* glsl */`
+      varying vec3 vDir;
+      uniform vec3 uZenith;
+      uniform vec3 uHorizon;
+      void main() {
+        float h = smoothstep(0.0, 0.35, vDir.y);
+        gl_FragColor = vec4(mix(uHorizon, uZenith, h), 1.0);
+      }`,
+  }));
+scene.add(skyDome);
+
+// 星星：两层不同大小的点云（不受雾影响）
+function makeStars(count, size, opacity, seed) {
+  const rng = mulberry32(seed);
+  const pos = new Float32Array(count * 3);
+  const v = new THREE.Vector3();
+  for (let i = 0; i < count; i++) {
+    do {
+      v.set(rng() * 2 - 1, rng(), rng() * 2 - 1).normalize();
+    } while (v.y < 0.06); // 只分布在地平线以上
+    pos.set([v.x, v.y, v.z].map((c) => c * CONFIG.sky.radius * 0.92), i * 3);
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  return new THREE.Points(geo, new THREE.PointsMaterial({
+    color: 0xdfe8ff, size, sizeAttenuation: false,
+    transparent: true, opacity, fog: false,
+  }));
+}
+scene.add(makeStars(CONFIG.sky.stars.count, 1.6, 0.9, 11));
+scene.add(makeStars(CONFIG.sky.stars.bright, 2.6, 1.0, 12));
+
+// 月亮：发光圆盘，位置与月光方向光一致，始终朝向相机
+const moonGroup = new THREE.Group();
+const moonDisc = new THREE.Mesh(
+  new THREE.CircleGeometry(CONFIG.sky.moon.size, 28),
+  new THREE.MeshBasicMaterial({ color: CONFIG.sky.moon.tint, fog: false }));
+moonGroup.add(moonDisc);
+moonGroup.position.copy(new THREE.Vector3(...CONFIG.lights.moon.position))
+  .normalize().multiplyScalar(CONFIG.sky.radius * 0.88);
+scene.add(moonGroup);
+
+// 低多边形云：块状簇缓慢漂移，远处融入夜色
+function buildClouds() {
+  const rng = mulberry32(CONFIG.sky.clouds.seed);
+  const mat = new THREE.MeshStandardMaterial({
+    color: CONFIG.sky.clouds.color, flatShading: true, roughness: 1,
+    emissive: 0x2a3550, emissiveIntensity: 1 }); // 夜云提亮，避免黑块
+  const group = new THREE.Group();
+  for (let i = 0; i < CONFIG.sky.clouds.count; i++) {
+    const cloud = new THREE.Group();
+    const puffs = 3 + Math.floor(rng() * 3);
+    for (let j = 0; j < puffs; j++) {
+      const s = 2.2 + rng() * 3.2;
+      const puff = new THREE.Mesh(new THREE.DodecahedronGeometry(s, 0), mat);
+      puff.position.set((rng() - 0.5) * 7, (rng() - 0.5) * 1.4, (rng() - 0.5) * 3);
+      puff.scale.y = 0.5 + rng() * 0.2;
+      cloud.add(puff);
+    }
+    const angle = rng() * Math.PI * 2;
+    const dist = 45 + rng() * 65;
+    cloud.position.set(Math.cos(angle) * dist, 22 + rng() * 16, Math.sin(angle) * dist);
+    cloud.userData.speed = (0.4 + rng() * 0.5) * CONFIG.sky.clouds.speed;
+    group.add(cloud);
+  }
+  return group;
+}
+const clouds = buildClouds();
+scene.add(clouds);
+
+/* ============================================================
  * 海面（T3 将替换为 shader 涌浪）
  * ============================================================ */
 const sea = new THREE.Mesh(
@@ -237,7 +349,18 @@ scene.add(sea);
 /* ============================================================
  * 动画（统一 tick）
  * ============================================================ */
+let lastT = 0;
 renderer.setAnimationLoop((t) => {
+  const dt = Math.min((t - lastT) / 1000, 0.05);
+  lastT = t;
+
+  // 云缓慢漂移，超出范围回绕
+  for (const cloud of clouds.children) {
+    cloud.position.x += cloud.userData.speed * dt;
+    if (cloud.position.x > 160) cloud.position.x = -160;
+  }
+  moonGroup.lookAt(camera.position);
+
   renderer.render(scene, camera);
 });
 </script>
