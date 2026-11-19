@@ -85,10 +85,12 @@ const CONFIG = {
     transition: 3,             // 状态过渡时长（秒）
     autoMin: 25, autoMax: 40,  // 自动轮换间隔（秒）
     rain: { count: 1500, area: 34, height: 26, speed: 11, len: 0.55 },
-    states: {  // 各天气的目标环境参数
-      clear:  { fog: 0.008,  moonI: 1,    moonO: 1,    wave: 1,    rain: 0, extraCloud: 0 },
-      cloudy: { fog: 0.014,  moonI: 0.5,  moonO: 0.45, wave: 1.15, rain: 0, extraCloud: 0.85 },
-      rainy:  { fog: 0.022,  moonI: 0.22, moonO: 0.15, wave: 1.3,  rain: 1, extraCloud: 0.9 },
+    lightning: { intervalMin: 3, intervalMax: 8, flashRise: 0.06, flashFall: 0.14, gap: 0.09, flashes: 2 },
+    states: {  // 各天气的目标环境参数（lightning 1 = 启用闪电）
+      clear:  { fog: 0.008,  moonI: 1,    moonO: 1,    wave: 1,    rain: 0,   extraCloud: 0,    lightning: 0 },
+      cloudy: { fog: 0.014,  moonI: 0.5,  moonO: 0.45, wave: 1.15, rain: 0,   extraCloud: 0.85, lightning: 0 },
+      rainy:  { fog: 0.022,  moonI: 0.22, moonO: 0.15, wave: 1.3,  rain: 1,   extraCloud: 0.9,  lightning: 0 },
+      storm:  { fog: 0.03,   moonI: 0.1,  moonO: 0.05, wave: 1.5,  rain: 1.4, extraCloud: 1,    lightning: 1 },
     },
   },
   gull: {
@@ -129,8 +131,9 @@ const camera = new THREE.PerspectiveCamera(
 camera.position.set(...CONFIG.camera.position);
 camera.lookAt(...CONFIG.camera.lookAt);
 
-scene.add(new THREE.HemisphereLight(
-  CONFIG.lights.hemi.sky, CONFIG.lights.hemi.ground, CONFIG.lights.hemi.intensity));
+const hemiLight = new THREE.HemisphereLight(
+  CONFIG.lights.hemi.sky, CONFIG.lights.hemi.ground, CONFIG.lights.hemi.intensity);
+scene.add(hemiLight);
 
 const moonLight = new THREE.DirectionalLight(
   CONFIG.lights.moon.color, CONFIG.lights.moon.intensity);
@@ -294,6 +297,7 @@ const skyDome = new THREE.Mesh(
     uniforms: {
       uZenith: { value: new THREE.Color(CONFIG.sky.zenith) },
       uHorizon: { value: new THREE.Color(CONFIG.sky.horizon) },
+      uFlash: { value: 0 }, // 闪电天空脉冲
     },
     vertexShader: /* glsl */`
       varying vec3 vDir;
@@ -305,9 +309,11 @@ const skyDome = new THREE.Mesh(
       varying vec3 vDir;
       uniform vec3 uZenith;
       uniform vec3 uHorizon;
+      uniform float uFlash;
       void main() {
         float h = smoothstep(0.0, 0.35, vDir.y);
-        gl_FragColor = vec4(mix(uHorizon, uZenith, h), 1.0);
+        vec3 col = mix(uHorizon, uZenith, h) + uFlash * vec3(0.5, 0.55, 0.65);
+        gl_FragColor = vec4(col, 1.0);
       }`,
   }));
 scene.add(skyDome);
@@ -512,7 +518,7 @@ scene.add(beamSpot);
 /* ============================================================
  * 天气系统：三态状态机 + 统一插值器 + 雨丝粒子
  * ============================================================ */
-const WEATHER_ORDER = ['clear', 'cloudy', 'rainy'];
+const WEATHER_ORDER = ['clear', 'cloudy', 'rainy', 'storm'];
 const weatherState = { ...CONFIG.weather.states.clear }; // 当前插值中的参数
 let weatherFrom = { ...weatherState };
 let weatherTo = { ...weatherState };
@@ -543,7 +549,7 @@ function setWeather(name) {
 
 addEventListener('keydown', (e) => {
   if (e.key === 'c' || e.key === 'C') {
-    setWeather(WEATHER_ORDER[(WEATHER_ORDER.indexOf(weatherName) + 1) % 3]);
+    setWeather(WEATHER_ORDER[(WEATHER_ORDER.indexOf(weatherName) + 1) % WEATHER_ORDER.length]);
   }
 });
 
@@ -578,7 +584,7 @@ function updateRain(dt) {
     const a = rainGeo.attributes.position.array;
     for (let i = 0; i < rainCfg.count; i++) {
       const j = i * 6;
-      a[j + 1] -= rainCfg.speed * dt;
+      a[j + 1] -= rainCfg.speed * dt * (0.75 + 0.35 * weatherState.rain); // 暴雨雨速更快
       if (a[j + 1] < 0) { // 落到底 → 回顶部随机位置
         a[j]     = (Math.random() - 0.5) * rainCfg.area;
         a[j + 1] = rainCfg.height * (0.9 + Math.random() * 0.2);
@@ -592,6 +598,77 @@ function updateRain(dt) {
   } else {
     rain.visible = false;
   }
+}
+
+/* ============================================================
+ * 闪电：锯齿闪电线 + 天空亮度脉冲（随机间隔双闪，纯代码无贴图）
+ * ============================================================ */
+const boltGeo = new THREE.BufferGeometry();
+const boltGeo2 = new THREE.BufferGeometry();
+const boltGeo3 = new THREE.BufferGeometry();
+const bolt = new THREE.Line(boltGeo, new THREE.LineBasicMaterial({
+  color: 0xffffff, transparent: true, opacity: 0, fog: false,
+  blending: THREE.AdditiveBlending, depthWrite: false }));
+const bolt2 = new THREE.Line(boltGeo2, bolt.material); // 平行副线 ×2，叠出粗细变化
+const bolt3 = new THREE.Line(boltGeo3, bolt.material);
+bolt.frustumCulled = bolt2.frustumCulled = bolt3.frustumCulled = false;
+bolt.visible = bolt2.visible = bolt3.visible = false;
+scene.add(bolt, bolt2, bolt3);
+
+const flash = { level: 0, timer: randRange(2.5, 5), seq: -1, seqT: 0 };
+
+function triggerBolt() { // 在相机视野锥内随机生成锯齿闪电劈向海面
+  const dir = new THREE.Vector3().subVectors(orbit.target, camera.position);
+  const viewAz = Math.atan2(dir.x, dir.z); // 当前视线水平方位
+  const az = viewAz + (Math.random() - 0.5) * (50 * Math.PI / 180);
+  const el = (8 + Math.random() * 20) * Math.PI / 180; // 仰角 8°~28°
+  const d = 24 + Math.random() * 16;
+  let x = camera.position.x + Math.sin(az) * Math.cos(el) * d;
+  let z = camera.position.z + Math.cos(az) * Math.cos(el) * d;
+  const yTop = camera.position.y + Math.sin(el) * d;
+  const p1 = [], p2 = [], p3 = [];
+  const segs = 6, yBot = 1;
+  for (let i = 0; i <= segs; i++) {
+    const y = yTop - ((yTop - yBot) / segs) * i;
+    if (i > 0) { x += (Math.random() - 0.5) * 3.5; z += (Math.random() - 0.5) * 3.5; }
+    p1.push(x, y, z);
+    p2.push(x + 0.5, y - 0.25, z + 0.3);
+    p3.push(x - 0.45, y - 0.2, z + 0.25);
+  }
+  boltGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(p1), 3));
+  boltGeo2.setAttribute('position', new THREE.BufferAttribute(new Float32Array(p2), 3));
+  boltGeo3.setAttribute('position', new THREE.BufferAttribute(new Float32Array(p3), 3));
+  bolt.visible = bolt2.visible = bolt3.visible = true;
+  flash.seq = 0;
+  flash.seqT = 0;
+}
+
+function updateLightning(dt) {
+  const L = CONFIG.weather.lightning;
+  if (weatherState.lightning > 0.9) { // 暴雨态：随机触发双闪序列
+    if (flash.seq < 0) {
+      flash.timer -= dt;
+      if (flash.timer <= 0) triggerBolt();
+    } else {
+      flash.seqT += dt;
+      const dur = L.flashRise + L.flashFall, cycle = dur + L.gap;
+      const t = flash.seqT % cycle;
+      if (flash.seqT >= L.flashes * cycle) { // 序列结束
+        flash.seq = -1;
+        flash.timer = randRange(L.intervalMin, L.intervalMax);
+        bolt.visible = bolt2.visible = bolt3.visible = false;
+        flash.level = 0;
+      } else if (t < L.flashRise) flash.level = t / L.flashRise;
+      else if (t < dur) flash.level = Math.max(0, 1 - (t - L.flashRise) / L.flashFall);
+      else flash.level = 0; // 双闪之间的暗隙
+      bolt.material.opacity = flash.level * 0.95;
+    }
+  } else { // 非暴雨态：脉冲快速衰减兜底
+    flash.level = Math.max(0, flash.level - dt * 6);
+    bolt.visible = bolt2.visible = bolt3.visible = false;
+  }
+  skyDome.material.uniforms.uFlash.value = flash.level;
+  hemiLight.intensity = CONFIG.lights.hemi.intensity * (1 + flash.level * 2.5);
 }
 
 /* ============================================================
@@ -779,6 +856,7 @@ renderer.setAnimationLoop((t) => {
   }
   applyWeather();
   updateRain(dt);
+  updateLightning(dt);
 
   // 云缓慢漂移，超出范围回绕（基础组 + 天气备用组）
   for (const cloud of cloudsBase.children) {
