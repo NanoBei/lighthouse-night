@@ -70,6 +70,12 @@ const CONFIG = {
     fill: { color: 0x8fa8d8, intensity: 0.5, position: [10, 8, 22] }, // 相机侧补光，防止背光面全黑
     lamp: { color: 0xffd9a0, intensity: 60, distance: 45 },
   },
+  beam: {
+    color: 0xffe0b0, length: 36, nearR: 0.15, farR: 1.7,
+    tilt: 0.09,          // 光束微下倾（弧度）
+    opacity: 0.55, speed: 0.5,  // 扫射角速度 rad/s
+    spot: { intensity: 50, angle: 0.12, penumbra: 0.6 },
+  },
 };
 
 /* ============================================================
@@ -123,9 +129,12 @@ const fillLight = new THREE.DirectionalLight(
 fillLight.position.set(...CONFIG.lights.fill.position);
 scene.add(fillLight);
 
+const lanternY = CONFIG.tower.baseY + CONFIG.tower.height + 0.16
+  + CONFIG.lantern.height / 2; // 灯室中心高度
+
 const lampLight = new THREE.PointLight(
   CONFIG.lights.lamp.color, CONFIG.lights.lamp.intensity, CONFIG.lights.lamp.distance);
-lampLight.position.set(0, 7.85, 0); // 灯室内部
+lampLight.position.set(0, lanternY, 0); // 灯室内部
 scene.add(lampLight);
 
 addEventListener('resize', () => {
@@ -396,6 +405,84 @@ sea.receiveShadow = true;
 scene.add(sea);
 
 /* ============================================================
+ * 光束系统：双光束锥（additive 伪体积）+ 灯室光晕 + 同步扫射聚光灯
+ * ============================================================ */
+// 程序生成径向渐变光晕贴图（canvas 纯代码，无外部资源）
+function makeHaloTexture() {
+  const c = document.createElement('canvas');
+  c.width = c.height = 128;
+  const ctx = c.getContext('2d');
+  const g = ctx.createRadialGradient(64, 64, 0, 64, 64, 64);
+  g.addColorStop(0, 'rgba(255, 224, 176, 0.85)');
+  g.addColorStop(0.35, 'rgba(255, 210, 150, 0.35)');
+  g.addColorStop(1, 'rgba(255, 200, 130, 0)');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, 128, 128);
+  return new THREE.CanvasTexture(c);
+}
+
+const halo = new THREE.Sprite(new THREE.SpriteMaterial({
+  map: makeHaloTexture(), transparent: true,
+  blending: THREE.AdditiveBlending, depthWrite: false, fog: false }));
+halo.scale.set(3.8, 3.8, 1);
+halo.position.set(0, lanternY, 0);
+scene.add(halo);
+
+const beamGroup = new THREE.Group();
+beamGroup.position.set(0, lanternY, 0);
+scene.add(beamGroup);
+
+// 光束锥 shader：沿长度渐隐（近端柔起、远端消散），避免均匀 opacity 的「灰板」感
+const beamMat = new THREE.ShaderMaterial({
+  transparent: true, depthWrite: false,
+  side: THREE.DoubleSide, blending: THREE.AdditiveBlending, fog: false,
+  uniforms: {
+    uColor: { value: new THREE.Color(CONFIG.beam.color) },
+    uOpacity: { value: CONFIG.beam.opacity },
+    uLength: { value: CONFIG.beam.length },
+  },
+  vertexShader: /* glsl */`
+    varying float vT;
+    uniform float uLength;
+    void main() {
+      vT = clamp(-position.y / uLength, 0.0, 1.0); // 0=灯室端 → 1=远端
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    }`,
+  fragmentShader: /* glsl */`
+    varying float vT;
+    uniform vec3 uColor;
+    uniform float uOpacity;
+    void main() {
+      float a = uOpacity
+        * smoothstep(0.0, 0.05, vT)    // 灯室端柔起，避免过曝堆积
+        * pow(1.0 - vT, 1.3);          // 沿距离渐隐
+      gl_FragColor = vec4(uColor, a);
+    }`,
+});
+const beamGeo = new THREE.CylinderGeometry(
+  CONFIG.beam.nearR, CONFIG.beam.farR, CONFIG.beam.length, 24, 1, true);
+beamGeo.translate(0, -CONFIG.beam.length / 2, 0); // 锥顶在原点，沿 -y 延伸
+
+for (const side of [0, Math.PI]) { // 两条对置光束
+  const beam = new THREE.Mesh(beamGeo, beamMat);
+  beam.rotation.order = 'YXZ';
+  beam.rotation.y = side;
+  beam.rotation.x = Math.PI / 2 - CONFIG.beam.tilt; // 转为水平并微下倾
+  beamGroup.add(beam);
+}
+
+// 聚光灯与光束同轴旋转，在水面扫出真实亮斑
+const beamSpot = new THREE.SpotLight(CONFIG.beam.color,
+  CONFIG.beam.spot.intensity, 60, CONFIG.beam.spot.angle,
+  CONFIG.beam.spot.penumbra, 1.2);
+beamSpot.position.set(0, lanternY, 0);
+const spotTarget = new THREE.Object3D();
+spotTarget.position.set(0, -Math.sin(CONFIG.beam.tilt) * 30, -Math.cos(CONFIG.beam.tilt) * 30);
+beamGroup.add(spotTarget); // 放入光束组，随其旋转
+beamSpot.target = spotTarget;
+scene.add(beamSpot);
+
+/* ============================================================
  * 动画（统一 tick）
  * ============================================================ */
 let lastT = 0;
@@ -405,6 +492,9 @@ renderer.setAnimationLoop((t) => {
 
   // 海面涌浪
   seaUniforms.uTime.value = t / 1000;
+
+  // 光束旋转扫射
+  beamGroup.rotation.y += CONFIG.beam.speed * dt;
 
   // 云缓慢漂移，超出范围回绕
   for (const cloud of clouds.children) {
