@@ -67,7 +67,7 @@ const CONFIG = {
     moon: { size: 7, tint: 0xf5f3e7 },
     clouds: { count: 8, seed: 7, color: 0x808aa0, speed: 0.6 },
     fog: { color: 0x0a1224, density: 0.008 },
-    hint: '🖱 拖拽旋转视角 · 滚轮缩放',
+    hint: 'C 切换天气 · 拖拽旋转 · 滚轮缩放',
   },
   lights: {
     hemi: { sky: 0x2a3a5e, ground: 0x0a0e1a, intensity: 0.55 },
@@ -80,6 +80,16 @@ const CONFIG = {
     tilt: 0.09,          // 光束微下倾（弧度）
     opacity: 0.55, speed: 0.5,  // 扫射角速度 rad/s
     spot: { intensity: 50, angle: 0.12, penumbra: 0.6 },
+  },
+  weather: {
+    transition: 3,             // 状态过渡时长（秒）
+    autoMin: 25, autoMax: 40,  // 自动轮换间隔（秒）
+    rain: { count: 1500, area: 34, height: 26, speed: 11, len: 0.55 },
+    states: {  // 各天气的目标环境参数
+      clear:  { fog: 0.008,  moonI: 1,    moonO: 1,    wave: 1,    rain: 0, extraCloud: 0 },
+      cloudy: { fog: 0.014,  moonI: 0.5,  moonO: 0.45, wave: 1.15, rain: 0, extraCloud: 0.85 },
+      rainy:  { fog: 0.022,  moonI: 0.22, moonO: 0.15, wave: 1.3,  rain: 1, extraCloud: 0.9 },
+    },
   },
 };
 
@@ -323,20 +333,22 @@ scene.add(makeStars(CONFIG.sky.stars.bright, 2.6, 1.0, 12));
 const moonGroup = new THREE.Group();
 const moonDisc = new THREE.Mesh(
   new THREE.CircleGeometry(CONFIG.sky.moon.size, 28),
-  new THREE.MeshBasicMaterial({ color: CONFIG.sky.moon.tint, fog: false }));
+  new THREE.MeshBasicMaterial({
+    color: CONFIG.sky.moon.tint, fog: false, transparent: true }));
 moonGroup.add(moonDisc);
 moonGroup.position.copy(new THREE.Vector3(...CONFIG.lights.moon.position))
   .normalize().multiplyScalar(CONFIG.sky.radius * 0.88);
 scene.add(moonGroup);
 
-// 低多边形云：块状簇缓慢漂移，远处融入夜色
-function buildClouds() {
-  const rng = mulberry32(CONFIG.sky.clouds.seed);
+// 低多边形云：块状簇缓慢漂移，远处融入夜色（基础组 + 天气备用组）
+function buildClouds(seed, count) {
+  const rng = mulberry32(seed);
   const mat = new THREE.MeshStandardMaterial({
     color: CONFIG.sky.clouds.color, flatShading: true, roughness: 1,
     emissive: 0x2a3550, emissiveIntensity: 1 }); // 夜云提亮，避免黑块
   const group = new THREE.Group();
-  for (let i = 0; i < CONFIG.sky.clouds.count; i++) {
+  group.userData.mat = mat;
+  for (let i = 0; i < count; i++) {
     const cloud = new THREE.Group();
     const puffs = 3 + Math.floor(rng() * 3);
     for (let j = 0; j < puffs; j++) {
@@ -354,14 +366,18 @@ function buildClouds() {
   }
   return group;
 }
-const clouds = buildClouds();
-scene.add(clouds);
+const cloudsBase = buildClouds(CONFIG.sky.clouds.seed, CONFIG.sky.clouds.count);
+const cloudsExtra = buildClouds(CONFIG.sky.clouds.seed + 101, CONFIG.sky.clouds.count);
+cloudsExtra.userData.mat.transparent = true; // 备用云组：多云/雨夜渐显
+cloudsExtra.userData.mat.opacity = 0;
+cloudsExtra.visible = false;
+scene.add(cloudsBase, cloudsExtra);
 
 /* ============================================================
  * 海面：标准材质 + onBeforeCompile 注入三层正弦波涌浪
  * （GPU 顶点位移 + 解析法线；光照、雾、阴影管线全部保留）
  * ============================================================ */
-const seaUniforms = { uTime: { value: 0 } };
+const seaUniforms = { uTime: { value: 0 }, uWaveScale: { value: 1 } };
 
 // 由 CONFIG 生成波参数常量与波场函数（波高 + 解析梯度）
 const seaWaveGLSL = CONFIG.sea.waves.map((w, i) => {
@@ -375,14 +391,15 @@ const seaWaveGLSL = CONFIG.sea.waves.map((w, i) => {
     `const float WSPD${i} = ${w.speed.toFixed(3)};`,
   ].join('\n');
 }).join('\n') + `
+uniform float uWaveScale; // 天气波高系数（雨夜风浪增大）
 float waveField(vec2 p, out vec2 grad) {
   float h = 0.0;
   grad = vec2(0.0);` +
   CONFIG.sea.waves.map((_, i) => `
   {
     float ph = dot(WDIR${i}, p) * WK${i} + uTime * WSPD${i};
-    h += WAMP${i} * sin(ph);
-    grad += WAMP${i} * WK${i} * WDIR${i} * cos(ph);
+    h += WAMP${i} * uWaveScale * sin(ph);
+    grad += WAMP${i} * WK${i} * WDIR${i} * uWaveScale * cos(ph);
   }`).join('') + `
   return h;
 }`;
@@ -391,6 +408,7 @@ const seaMat = new THREE.MeshStandardMaterial({
   color: CONFIG.sea.color, roughness: 0.35, metalness: 0.1 });
 seaMat.onBeforeCompile = (shader) => {
   shader.uniforms.uTime = seaUniforms.uTime;
+  shader.uniforms.uWaveScale = seaUniforms.uWaveScale;
   shader.vertexShader = shader.vertexShader
     .replace('#include <common>', `#include <common>
 uniform float uTime;
@@ -486,6 +504,91 @@ spotTarget.position.set(0, -Math.sin(CONFIG.beam.tilt) * 30, -Math.cos(CONFIG.be
 beamGroup.add(spotTarget); // 放入光束组，随其旋转
 beamSpot.target = spotTarget;
 scene.add(beamSpot);
+
+/* ============================================================
+ * 天气系统：三态状态机 + 统一插值器 + 雨丝粒子
+ * ============================================================ */
+const WEATHER_ORDER = ['clear', 'cloudy', 'rainy'];
+const weatherState = { ...CONFIG.weather.states.clear }; // 当前插值中的参数
+let weatherFrom = { ...weatherState };
+let weatherTo = { ...weatherState };
+let weatherT = 1;              // 过渡进度 0→1（1 = 已到位）
+let weatherName = 'clear';
+let autoTimer = 0;
+const randRange = (a, b) => a + Math.random() * (b - a);
+let autoNext = randRange(CONFIG.weather.autoMin, CONFIG.weather.autoMax);
+
+function applyWeather() {
+  const p = weatherState;
+  scene.fog.density = p.fog;
+  moonLight.intensity = CONFIG.lights.moon.intensity * p.moonI;
+  moonDisc.material.opacity = p.moonO;
+  seaUniforms.uWaveScale.value = p.wave;
+  cloudsExtra.visible = p.extraCloud > 0.02;
+  cloudsExtra.userData.mat.opacity = p.extraCloud;
+}
+
+function setWeather(name) {
+  weatherName = name;
+  weatherFrom = { ...weatherState };
+  weatherTo = { ...CONFIG.weather.states[name] };
+  weatherT = 0;
+  autoTimer = 0; // 手动与自动切换都重置轮换计时
+  autoNext = randRange(CONFIG.weather.autoMin, CONFIG.weather.autoMax);
+}
+
+addEventListener('keydown', (e) => {
+  if (e.key === 'c' || e.key === 'C') {
+    setWeather(WEATHER_ORDER[(WEATHER_ORDER.indexOf(weatherName) + 1) % 3]);
+  }
+});
+
+// 雨丝：LineSegments 竖直微斜，跟随相机循环下落（纯代码无贴图）
+const rainCfg = CONFIG.weather.rain;
+const rainGeo = new THREE.BufferGeometry();
+{
+  const pos = new Float32Array(rainCfg.count * 6);
+  for (let i = 0; i < rainCfg.count; i++) {
+    pos[i * 6]     = (Math.random() - 0.5) * rainCfg.area;
+    pos[i * 6 + 1] = Math.random() * rainCfg.height;
+    pos[i * 6 + 2] = (Math.random() - 0.5) * rainCfg.area;
+  }
+  rainGeo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+}
+const rainMat = new THREE.LineBasicMaterial({
+  color: 0x9fb4d8, transparent: true, opacity: 0 });
+const rain = new THREE.LineSegments(rainGeo, rainMat);
+rain.frustumCulled = false;
+rain.visible = false;
+scene.add(rain);
+const DROP = (() => { // 雨丝方向（微斜），尾端 = 头端 + DROP
+  const k = rainCfg.len / Math.hypot(0.25, 1);
+  return [0.25 * k, -k, 0];
+})();
+
+function updateRain(dt) {
+  if (weatherState.rain > 0.02) {
+    rain.visible = true;
+    rainMat.opacity = 0.5 * weatherState.rain;
+    rain.position.set(camera.position.x, 0, camera.position.z);
+    const a = rainGeo.attributes.position.array;
+    for (let i = 0; i < rainCfg.count; i++) {
+      const j = i * 6;
+      a[j + 1] -= rainCfg.speed * dt;
+      if (a[j + 1] < 0) { // 落到底 → 回顶部随机位置
+        a[j]     = (Math.random() - 0.5) * rainCfg.area;
+        a[j + 1] = rainCfg.height * (0.9 + Math.random() * 0.2);
+        a[j + 2] = (Math.random() - 0.5) * rainCfg.area;
+      }
+      a[j + 3] = a[j] + DROP[0];
+      a[j + 4] = a[j + 1] + DROP[1];
+      a[j + 5] = a[j + 2] + DROP[2];
+    }
+    rainGeo.attributes.position.needsUpdate = true;
+  } else {
+    rain.visible = false;
+  }
+}
 
 /* ============================================================
  * 相机控制：手写轨道控制器（球坐标 + 阻尼 + 触屏）
@@ -591,8 +694,28 @@ renderer.setAnimationLoop((t) => {
     camera.lookAt(orbit.target);
   }
 
-  // 云缓慢漂移，超出范围回绕
-  for (const cloud of clouds.children) {
+  // 天气：过渡插值 + 自动轮换
+  if (weatherT < 1) {
+    weatherT = Math.min(weatherT + dt / CONFIG.weather.transition, 1);
+    const s = weatherT * weatherT * (3 - 2 * weatherT); // smoothstep 缓入缓出
+    for (const key in weatherState) {
+      weatherState[key] = weatherFrom[key] + (weatherTo[key] - weatherFrom[key]) * s;
+    }
+  }
+  autoTimer += dt;
+  if (autoTimer >= autoNext) {
+    const pool = WEATHER_ORDER.filter((n) => n !== weatherName);
+    setWeather(pool[Math.floor(Math.random() * pool.length)]);
+  }
+  applyWeather();
+  updateRain(dt);
+
+  // 云缓慢漂移，超出范围回绕（基础组 + 天气备用组）
+  for (const cloud of cloudsBase.children) {
+    cloud.position.x += cloud.userData.speed * dt;
+    if (cloud.position.x > 160) cloud.position.x = -160;
+  }
+  for (const cloud of cloudsExtra.children) {
     cloud.position.x += cloud.userData.speed * dt;
     if (cloud.position.x > 160) cloud.position.x = -160;
   }
